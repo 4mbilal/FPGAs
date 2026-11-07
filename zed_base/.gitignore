@@ -1,0 +1,30 @@
+# Vivado project (rebuilt from zed_base.tcl) and shared IP cache
+/zed_base/
+/ip_cache/
+.Xil/
+*.jou
+*.log
+*.str
+vivado_pid*
+utilization.txt
+timing_summary.txt
+*.xsa
+*.bit
+
+# Vitis workspace
+/vitis/
+_ide/
+.analytics
+logs/
+
+# simulation outputs
+sim/out/
+*.vcd
+*.fst
+slot_vectors.txt
+hdmi_vectors.txt
+
+# editors / OS
+.vscode/
+*.swp
+.DS_Store

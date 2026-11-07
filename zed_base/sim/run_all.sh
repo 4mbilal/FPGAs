@@ -1,0 +1,15 @@
+#!/bin/sh
+# run_all.sh - runs every RTL testbench and C/Python model check (Icarus Verilog, gcc, python3).
+#   sh sim/run_all.sh          (from the repository root)
+# Outputs go to sim/out/ (ignored by git).
+set -e
+cd "$(dirname "$0")/.."
+O=sim/out; mkdir -p $O
+
+echo "== dvp_capture";    iverilog -g2005 -o $O/tb_dvp  sim/tb_dvp_capture.v rtl/dvp_capture.v && vvp -n $O/tb_dvp | tail -3
+echo "== proc_slot";      iverilog -g2005 -o $O/tb_slot sim/tb_proc_slot.v rtl/proc_slot.v && (cd $O && vvp -n tb_slot | tail -7)
+gcc -I sw/common -o $O/check_vectors sim/check_vectors.c sw/common/sw_kernels.c && $O/check_vectors $O/slot_vectors.txt
+echo "== proc_slot memory input"; iverilog -g2005 -o $O/tb_mem sim/tb_proc_slot_mem.v rtl/proc_slot.v && vvp -n $O/tb_mem | tail -6
+echo "== hdmi_pack";      iverilog -g2005 -o $O/tb_hdmi sim/tb_hdmi_pack.v rtl/hdmi_pack.v && (cd $O && vvp -n tb_hdmi | tail -1)
+gcc -O2 -o $O/check_hdmi sim/check_hdmi.c && $O/check_hdmi $O/hdmi_vectors.txt
+echo "== buffer rotation model"; python3 sim/rotation_model.py | tail -4
