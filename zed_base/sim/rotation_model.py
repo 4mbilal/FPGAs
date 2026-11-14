@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""rotation_model.py - discrete-event model of the buffer rotation in sw/jig.c and sw/proc_test.c.
+"""rotation_model.py - discrete-event model of the buffer rotation in sw/common/jig.c.
 
 Hardware model: each frame buffer DMA latches its address register at frame start; with
 auto-restart a frame starts the moment the previous one is done, and the 1-bit done flag

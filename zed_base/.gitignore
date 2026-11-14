@@ -23,8 +23,16 @@ sim/out/
 *.fst
 slot_vectors.txt
 hdmi_vectors.txt
+lle_vectors.txt
 
 # editors / OS
 .vscode/
 *.swp
 .DS_Store
+
+
+# Linux builds on the board
+sw/linux_c/build/
+sw/linux_c/jig
+*.so
+__pycache__/

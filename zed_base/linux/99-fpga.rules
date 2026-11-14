@@ -1,0 +1,7 @@
+# /etc/udev/rules.d/99-fpga.rules - PL access for the fpga group (users of the jig without sudo)
+KERNEL=="uio[0-9]*",      GROUP="fpga", MODE="0660"
+KERNEL=="udmabuf[0-9]*",  GROUP="fpga", MODE="0660"
+SUBSYSTEM=="u-dma-buf",   GROUP="fpga", MODE="0660"
+SUBSYSTEM=="u-dma-buf",   RUN+="/bin/sh -c 'chgrp fpga /sys%p/sync_* && chmod g+w /sys%p/sync_*'"
+KERNEL=="gpiochip[0-9]*", GROUP="fpga", MODE="0660"
+KERNEL=="i2c-[0-9]*",     GROUP="fpga", MODE="0660"

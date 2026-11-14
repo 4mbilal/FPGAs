@@ -1,6 +1,6 @@
 // jig.c - zed_base test application: one program, everything from the UART menu.
 //
-// Source files for the Vitis app (all flat in src/): jig.c + everything in sw/common/
+// Source files for the Vitis app (all flat in src/): everything in sw/common/
 // (zb_platform.c/.h, ov2640_regs.h, sw_kernels.c/.h). Replaces vga_test.c, cam_test.c
 // and proc_test.c. Works without a camera (test patterns and memory test only).
 //
@@ -15,8 +15,12 @@
 //   d / D    next / previous display mode (640x480 .. 1920x1080)
 //   c / C    next / previous camera size (OV2640: QCIF .. UXGA 1600x1200)
 //   0 1 2 3  kernel: none, grayscale, invert, Sobel (Sobel runs on the CPU only)
+//   4        kernel: low-light enhancement, global curve (LiteIE rule; proc_slot mode 3 with
+//            a per-frame table built from the slot's frame statistics, or on the CPU;
+//            needs proc_slot v5, ID 0x534C0005, shell v7)
 //   x        run the kernel in HW (proc_slot) or SW (CPU)
-//   m        memory test, generated image          l   memory test, image loaded at 0x10000000
+//   n        LLE iteration count: auto (LiteIE rule) or forced 2 / 4 / 8 / 12
+//   m        memory test, generated image          l   memory test, image loaded at 0x10000000 (Linux: $ZB_IMAGE)
 //   r        next memory-test size                 s   status line now
 //   v        debug: DMA / VTC / pixel clock state  h   menu
 //   g        gap test: locates a memory-test pixel shift (read side, write side or stream)
@@ -35,7 +39,11 @@
 // over JTAG with xsct, e.g. (XRGB8888, little endian, i.e. 0x00RRGGBB per pixel):
 //   xsct% dow -data image_1920x1080.bin 0x10000000
 //   xsct% mrd -bin -file result.bin 0x11000000 [expr 1920*1080]
-// sw/tools/rawimg.py converts PNG <-> raw.
+// tools/rawimg.py converts PNG <-> raw.
+//
+// Batch mode (datasets, no key presses): a mailbox in DRAM at 0x13000000 (see MBOX_*),
+// driven from xsct by tools/batch.tcl. Each job: packed XRGB8888 image at 0x10000000,
+// hardware result written packed to 0x11000000, C golden model result to 0x12000000.
 
 #include <string.h>
 #include "xparameters.h"
@@ -45,6 +53,20 @@
 #include "sleep.h"
 #include "zb_platform.h"
 #include "sw_kernels.h"
+#include "lle_global.h"
+// One source for both targets. The Linux build (sw/linux_c/Makefile) defines ZB_LINUX:
+// buffers live in the u-dma-buf region, the CPU edge kernel is OpenCV Canny, and the
+// DRAM mailbox batch mode is left out. (__linux__ cannot be used: the Linux build compiles
+// the bare-metal code paths of the Xilinx drivers with -U__linux__.)
+#ifdef ZB_LINUX
+#include "zb_linux.h"
+#include "zb_cv.h"
+#define EDGE_NAME "Canny"
+#define K_EDGE(p, w, h, s) k_canny(p, w, h, s)
+#else
+#define EDGE_NAME "Sobel"
+#define K_EDGE(p, w, h, s) k_sobel(p, w, h, s, sobel_tmp)
+#endif
 
 // ---- proc_slot ---------------------------------------------------------------------
 #ifdef XPAR_PROC_SLOT_BASEADDR
@@ -62,15 +84,84 @@
 #define SLOT_ACTIVE_CYCLES 0x1C
 #define SLOT_PIXELS_RUN    0x20
 #define SLOT_LINES_RUN     0x24
+#define SLOT_CAPS          0x28
+#define SLOT_LUT_BANK      0x2C
+#define SLOT_STAT_SEQ      0x30
+#define SLOT_STAT_CTRL     0x34
+#define SLOT_IRQ_EN        0x38
+#define SLOT_IRQ_STATUS    0x3C
+#define SLOT_LUT0          0x400      /* R at 0x400, G at 0x800, B at 0xC00, one entry per word */
+#define SLOT_STAT_COUNT    0x1000
+#define SLOT_SUM_R         0x1004
+#define SLOT_HIST0         0x1040
+#define SLOT_ID_EXPECTED   0x534C0005u
+#define SLOT_MODE_LUT      3
 #define SLOT_SRC_MEM       0x10
 #define SLOT_CLK_HZ        150000000u
 static u32  slot_rd(u32 off)        { return Xil_In32(SLOT_BASE + off); }
 static void slot_wr(u32 off, u32 v) { Xil_Out32(SLOT_BASE + off, v); }
 
-// ---- memory test buffers (fixed addresses, outside the program image) ---------------
+// ---- curve table and frame statistics (proc_slot v4) ----------------------------------
+static void lut_write(const u8 t[3][256])                 // into the inactive bank
+{
+    for (int c = 0; c < 3; c++) for (int x = 0; x < 256; x++) slot_wr(SLOT_LUT0 + 0x400 * c + 4 * x, t[c][x]);
+}
+static int  lut_swap_pending(void) { return slot_rd(SLOT_LUT_BANK) & 1; }
+static void lut_swap(void)         { slot_wr(SLOT_LUT_BANK, 1); }   // at the next start of frame
+static void slot_stats(lle_stats_t *s)                    // latched set
+{
+    s->count = slot_rd(SLOT_STAT_COUNT);
+    for (int c = 0; c < 3; c++) s->sum[c] = slot_rd(SLOT_SUM_R + 4 * c);
+    for (int k = 0; k < 16; k++) s->hist[k] = slot_rd(SLOT_HIST0 + 4 * k);
+}
+static int stats_equal(const lle_stats_t *a, const lle_stats_t *b)
+{
+    if (a->count != b->count) return 0;
+    for (int c = 0; c < 3; c++) if (a->sum[c] != b->sum[c]) return 0;
+    for (int k = 0; k < 16; k++) if (a->hist[k] != b->hist[k]) return 0;
+    return 1;
+}
+static u32 mean_x1000(const lle_stats_t *s) { return (u32)(lle_mean(s) * 1000.0 + 0.5); }
+
+// live HW path: table for the iteration count of the latest latched statistics
+static u32 lle_seq_seen;
+static int lle_n_active = -1, lle_n_last = -1;            // table in (or queued for) use; latest count
+static u32 lle_mean_last;
+// 'n': iteration count forced for demonstrations (0 = auto, the LiteIE rule)
+static const int lle_force_tab[5] = { 0, 2, 4, 8, 12 };
+static int lle_force;
+static int lle_pick(const lle_stats_t *s) { return lle_force_tab[lle_force] ? lle_force_tab[lle_force] : lle_liteie_iters(s); }
+// Returns 0 if an earlier table is still queued after 200 ms (no frame is arriving, e.g. no
+// camera): writing now would overwrite the queued table, so nothing is loaded.
+static int lle_load(int n)
+{
+    u8 t[3][256];
+    u64 t0 = zb_time();
+    while (lut_swap_pending())                            // the queued table must be in use first
+        if (zb_time() - t0 > zb_time_hz() / 5) return 0;
+    lle_build_table(t, lle_liteie_r, n);
+    lut_write(t);
+    lut_swap();
+    lle_n_active = n;
+    return 1;
+}
+
+// ---- memory test buffers ---------------------------------------------------------------
+#ifdef ZB_LINUX
+// in the u-dma-buf region, after the NBUF live buffers (6 x 1920x1200x4 = 55.3 MB);
+// needs a u-dma-buf of at least 86 MB
+#define TEST_IN   (zb_dma_base() + 0x03800000u)
+#define TEST_OUT  (zb_dma_base() + 0x04200000u)
+#define TEST_REF  (zb_dma_base() + 0x04C00000u)
+#define TEST_END  0x05600000u
+#define TEST_OK() (zb_dma_size() >= TEST_END)
+#else
+// fixed DRAM addresses, outside the program image
 #define TEST_IN   0x10000000u
 #define TEST_OUT  0x11000000u
 #define TEST_REF  0x12000000u
+#define TEST_OK() 1
+#endif
 #define TEST_MAX_W 1920
 #define TEST_MAX_H 1200
 static const struct { u16 w, h; } test_sizes[] = {
@@ -84,14 +175,19 @@ static int cam_ok;                 // camera detected and configured
 static int src_pattern;            // 1: show a test pattern instead of the camera
 static int pattern;                // 0 bars, 1 checkerboard, 2 grey ramp
 static int path_sw;                // 0: kernel in proc_slot, 1: kernel on the CPU
-static int kern;                   // 0 none, 1 gray, 2 invert, 3 Sobel (SW only)
-static const char *kern_name[4] = { "none", "grayscale", "invert", "Sobel" };
+static int kern;                   // 0 none, 1 gray, 2 invert, 3 Sobel (SW only), 4 LLE global curve
+static const char *kern_name[5] = { "none", "grayscale", "invert", EDGE_NAME, "LLE global" };
+static u32 hw_mode_of(int k) { return k == 1 || k == 2 ? (u32)k : k == 4 ? SLOT_MODE_LUT : 0; }
 static const char *pat_name[3]  = { "colour bars", "checkerboard", "grey ramp" };
 
 // ---- live buffers ------------------------------------------------------------------
 #define NBUF       6
 #define CANVAS_MAX (1920 * 1200)
+#ifdef ZB_LINUX
+static u32 (*buf)[CANVAS_MAX];     // start of the u-dma-buf region (set in main)
+#else
 static u32 buf[NBUF][CANVAS_MAX] __attribute__((aligned(4096)));
+#endif
 static u8  sobel_tmp[TEST_MAX_W * TEST_MAX_H];
 
 static int cam_w, cam_p, disp_reg, disp_scan, disp_prev = -1, raw_ready = -1, cpu_hold = -1;
@@ -228,9 +324,218 @@ static u32 test_pixel(int x, int y)
     return (r << 16) | (g << 8) | b;
 }
 
-static void run_mem_test(int kernel, int use_loaded)
+// ---- low-light enhancement on still images (memory test 'l'/'m' with kernel 4, batch) ----
+// Two passes through proc_slot, as a still image has no previous frame:
+//   1. pass-through, statistics latched with STAT_CTRL and read back
+//   2. curve-table mode with the table built from those statistics
+// The C golden model (sw/common/lle_global.c) computes its own statistics and table on the CPU;
+// statistics, iteration count and every pixel must agree.
+typedef struct { int ok; u32 act, px, lines; u64 t0, t1; } pass_t;
+
+static int dma_pass(u32 ctrl, UINTPTR in, UINTPTR out, int w, int h, u32 stride, pass_t *r)
+{
+    const u64 hz = zb_time_hz();
+    memset(r, 0, sizeof(*r));
+    zb_fbw_stop();
+    slot_wr(SLOT_CTRL, ctrl);
+    r->t0 = zb_time();
+    if (zb_fbw_single(out, w, h, stride) != XST_SUCCESS || zb_fbr2_single(in, w, h, stride) != XST_SUCCESS)
+        return 0;
+    int wr = 0, rd = 0, slot = 0;
+    while (zb_time() - r->t0 < hz) {
+        if (!wr) wr = zb_fbw_done();
+        if (!rd) rd = zb_fbr2_done();
+        r->px = slot_rd(SLOT_PIXELS_RUN); r->lines = slot_rd(SLOT_LINES_RUN);
+        if (!slot) slot = (r->px == (u32)w * h && r->lines == (u32)h);
+        if (wr && rd && slot) break;
+    }
+    r->t1 = zb_time();
+    r->act = slot_rd(SLOT_ACTIVE_CYCLES);
+    r->ok = slot && wr;
+    return r->ok;
+}
+
+typedef struct {
+    int ok, n_hw, n_sw, stats_ok;
+    u32 mismatches, act, mean_x1000;
+    u64 sw_ticks;
+    lle_stats_t hw, sw;
+} lle_job_t;
+
+// in/out: images with stride (bytes) for the DMAs; ref: packed w x h for the C model
+static void lle_job(int w, int h, UINTPTR in, UINTPTR out, u32 stride, u32 *ref, lle_job_t *j)
+{
+    const u32 bytes = (u32)h * stride;
+    pass_t p1, p2;
+    memset(j, 0, sizeof(*j));
+    Xil_DCacheFlushRange(in, bytes);
+    memset((void *)out, 0xA5, bytes);
+    Xil_DCacheFlushRange(out, bytes);
+
+    // pass 1: statistics
+    if (!dma_pass(SLOT_SRC_MEM, in, out, w, h, stride, &p1)) { slot_wr(SLOT_CTRL, live_hw_mode); return; }
+    slot_wr(SLOT_STAT_CTRL, 1);
+    slot_stats(&j->hw);
+    j->n_hw = lle_liteie_iters(&j->hw);
+    lle_load(j->n_hw);
+    // pass 2: curve table
+    memset((void *)out, 0xA5, bytes);
+    Xil_DCacheFlushRange(out, bytes);
+    int ok = dma_pass(SLOT_SRC_MEM | SLOT_MODE_LUT, in, out, w, h, stride, &p2);
+    slot_wr(SLOT_CTRL, live_hw_mode);
+    lle_n_active = -1;                                    // live path rebuilds its table
+    if (!ok) return;
+    j->act = p2.act;
+
+    // C golden model on the same input
+    const u32 *src = (const u32 *)in;
+    for (int y = 0; y < h; y++) memcpy(ref + (long)y * w, src + (long)y * (stride / 4), (u32)w * 4);
+    u64 s0 = zb_time();
+    u8 tab[3][256];
+    lle_stats(ref, w, h, w, &j->sw);
+    j->n_sw = lle_liteie_iters(&j->sw);
+    lle_build_table(tab, lle_liteie_r, j->n_sw);
+    lle_apply(ref, w, h, w, tab);
+    j->sw_ticks = zb_time() - s0;
+    j->stats_ok = stats_equal(&j->hw, &j->sw);
+    j->mean_x1000 = mean_x1000(&j->sw);
+
+    Xil_DCacheInvalidateRange(out, bytes);
+    const u32 *o = (const u32 *)out;
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++)
+            if ((o[(long)y * (stride / 4) + x] & 0xFFFFFF) != (ref[(long)y * w + x] & 0xFFFFFF)) j->mismatches++;
+    j->ok = 1;
+}
+
+static void lle_report(const lle_job_t *j, int w, int h)
+{
+    const u32 hz = zb_time_hz();
+    u32 hw_us_x10 = j->act ? (u32)(((u64)j->act * 10000000ULL) / SLOT_CLK_HZ) : 0;
+    u32 sw_us = (u32)((j->sw_ticks * 1000000ULL) / hz);
+    xil_printf("  mean %u.%03u -> %d iterations (HW statistics) / %d (C model); statistics %s\r\n",
+               j->mean_x1000 / 1000, j->mean_x1000 % 1000, j->n_hw, j->n_sw,
+               j->stats_ok ? "identical" : "DIFFER");
+    xil_printf("  HW curve pass: %u.%u us in the slot; C model (statistics + table + apply): %u us\r\n",
+               hw_us_x10 / 10, hw_us_x10 % 10, sw_us);
+    xil_printf("  %s: %u of %u pixels differ between HW and the C golden model\r\n",
+               (j->ok && !j->mismatches && j->stats_ok) ? "PASS" : "FAIL", j->mismatches, (u32)w * h);
+}
+
+
+// 'l': the input image. Bare metal: loaded over JTAG at TEST_IN (xsct dow -data).
+// Linux: read from the raw XRGB8888 file named by ZB_IMAGE (tools/rawimg.py to-raw),
+// w x h of the current memory-test size.
+#ifdef ZB_LINUX
+#include <stdio.h>
+#include <stdlib.h>
+#define LOADED_DESC "from $ZB_IMAGE"
+static int load_input(int w, int h)
+{
+    const char *f = getenv("ZB_IMAGE");
+    FILE *fp = f ? fopen(f, "rb") : NULL;
+    if (!fp) { xil_printf("  set ZB_IMAGE=<raw XRGB8888 file of %dx%d> for 'l'\r\n", w, h); return 0; }
+    size_t n = fread((void *)TEST_IN, 4, (size_t)w * h, fp);
+    fclose(fp);
+    if (n != (size_t)w * h) { xil_printf("  %s: %u pixels, expected %d\r\n", f, (u32)n, w * h); return 0; }
+    return 1;
+}
+#else
+#define LOADED_DESC "loaded at 0x10000000"
+static int load_input(int w, int h) { (void)w; (void)h; return 1; }
+#endif
+
+static void lle_mem_test(int use_loaded)
 {
     if (!zb_fbr2_available()) { xil_printf("Memory test needs v5 hardware (vfb_rd2)\r\n"); return; }
+    if (!TEST_OK()) { xil_printf("Memory test needs a u-dma-buf of >= 86 MB\r\n"); return; }
+    const int w = test_sizes[test_size].w, h = test_sizes[test_size].h;
+    u32 *in = (u32 *)TEST_IN;
+    xil_printf("\r\nMemory test %dx%d, low-light enhancement (global curve), input %s\r\n", w, h,
+               use_loaded ? LOADED_DESC : "generated (darkened)");
+    if (use_loaded && !load_input(w, h)) return;
+    if (!use_loaded)
+        for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) in[y * w + x] = (test_pixel(x, y) >> 2) & 0x3F3F3F;
+    lle_job_t j;
+    zb_diag = 0;
+    lle_job(w, h, TEST_IN, TEST_OUT, (u32)w * 4, (u32 *)TEST_REF, &j);
+    if (!j.ok) xil_printf("  FAIL: a test frame did not pass through proc_slot completely\r\n");
+    lle_report(&j, w, h);
+    xil_printf("  Input 0x%08x, HW result 0x%08x, C model 0x%08x\r\n", TEST_IN, TEST_OUT, TEST_REF);
+    if (j.ok && w >= disp_w && h >= disp_h) {
+        u32 off = (u32)(((h - disp_h) / 2) * w + (((w - disp_w) / 2) & ~7)) * 4;
+        zb_fbr_config(TEST_OUT + off, disp_w, disp_h, w * 4);
+        sleep(3);
+    }
+    apply_config(zb_display_mode(), zb_camera_size(), 0, 0);
+}
+
+#if !defined(ZB_LINUX)    /* bare metal only: under Linux, datasets go through sw/python/lle_batch.py */
+// ---- batch mode: mailbox in DRAM, driven by xsct (tools/batch.tcl) -----------------
+// Host: load the packed image at TEST_IN, write w, h, kernel, then cmd = 1 (last).
+// Jig:  cmd = 0, status = 1 (busy); runs the job; fills the results; status = 2 (done) or
+//       3 (error). Results: HW image packed at TEST_OUT, C model image packed at TEST_REF.
+#define MBOX            0x13000000u
+#define MBOX_CMD        0       /* word offsets */
+#define MBOX_W          1
+#define MBOX_H          2
+#define MBOX_KERNEL     3       /* 4 = low-light enhancement, global curve */
+#define MBOX_STATUS     4
+#define MBOX_SEQ        5       /* incremented per finished job */
+#define MBOX_ITERS      6       /* iteration count from the HW statistics */
+#define MBOX_MEAN       7       /* frame mean x 1e6 */
+#define MBOX_MISMATCH   8       /* pixels differing between HW and the C model */
+#define MBOX_STATS_OK   9       /* 1: HW statistics identical to the C model's */
+#define MBOX_CYCLES     10      /* slot active cycles of the curve pass */
+#define MBOX_WORDS      16
+#define PAD_IN          0x14000000u
+#define PAD_OUT         0x15000000u
+
+static void mbox_poll(void)
+{
+    volatile u32 *m = (volatile u32 *)MBOX;
+    Xil_DCacheInvalidateRange(MBOX, MBOX_WORDS * 4);
+    if (m[MBOX_CMD] != 1) return;
+    m[MBOX_CMD] = 0; m[MBOX_STATUS] = 1;
+    Xil_DCacheFlushRange(MBOX, MBOX_WORDS * 4);
+    int w = (int)m[MBOX_W], h = (int)m[MBOX_H], k = (int)m[MBOX_KERNEL];
+    int err = !zb_fbr2_available() || k != 4 || w < 8 || h < 8 || w > TEST_MAX_W || h > TEST_MAX_H;
+    lle_job_t j;
+    memset(&j, 0, sizeof(j));
+    if (!err) {
+        // the DMAs get a 256-byte aligned stride; the host image is packed
+        u32 stride = ((u32)w * 4 + 255) & ~255u;
+        Xil_DCacheInvalidateRange(TEST_IN, (u32)w * h * 4);
+        for (int y = 0; y < h; y++)
+            memcpy((u32 *)PAD_IN + (long)y * (stride / 4), (u32 *)TEST_IN + (long)y * w, (u32)w * 4);
+        lle_job(w, h, PAD_IN, PAD_OUT, stride, (u32 *)TEST_REF, &j);
+        for (int y = 0; y < h; y++)
+            memcpy((u32 *)TEST_OUT + (long)y * w, (u32 *)PAD_OUT + (long)y * (stride / 4), (u32)w * 4);
+        Xil_DCacheFlushRange(TEST_OUT, (u32)w * h * 4);
+        Xil_DCacheFlushRange(TEST_REF, (u32)w * h * 4);
+        err = !j.ok;
+        apply_config(zb_display_mode(), zb_camera_size(), 0, 0);
+    }
+    m[MBOX_ITERS] = (u32)j.n_hw;
+    m[MBOX_MEAN] = (u32)(lle_mean(&j.hw) * 1e6 + 0.5);
+    m[MBOX_MISMATCH] = j.mismatches;
+    m[MBOX_STATS_OK] = (u32)j.stats_ok;
+    m[MBOX_CYCLES] = j.act;
+    m[MBOX_SEQ] = m[MBOX_SEQ] + 1;
+    m[MBOX_STATUS] = err ? 3 : 2;
+    Xil_DCacheFlushRange(MBOX, MBOX_WORDS * 4);
+    xil_printf("batch %u: %dx%d n=%d mismatches %u stats %s -> %s\r\n", m[MBOX_SEQ], w, h, j.n_hw,
+               j.mismatches, j.stats_ok ? "ok" : "differ", err ? "ERROR" : "done");
+}
+#else
+static void mbox_poll(void) { }
+#endif
+
+static void run_mem_test(int kernel, int use_loaded)
+{
+    if (kernel == 4) { lle_mem_test(use_loaded); return; }
+    if (!zb_fbr2_available()) { xil_printf("Memory test needs v5 hardware (vfb_rd2)\r\n"); return; }
+    if (!TEST_OK()) { xil_printf("Memory test needs a u-dma-buf of >= 86 MB\r\n"); return; }
     const int w = test_sizes[test_size].w, h = test_sizes[test_size].h;
     const u32 bytes = (u32)w * h * 4, stride = (u32)w * 4;
     u32 *in = (u32 *)TEST_IN, *out = (u32 *)TEST_OUT, *ref = (u32 *)TEST_REF;
@@ -238,10 +543,11 @@ static void run_mem_test(int kernel, int use_loaded)
     // kernels the slot implements; Sobel is SW-only, so the HW runs pass-through for it
     const u32 hw_mode = (kernel == 1 || kernel == 2) ? (u32)kernel : 0;
     const int ref_kernel = (int)hw_mode;
-    static const char *kname[4] = { "none", "grayscale", "invert", "Sobel(SW only -> HW pass)" };
+    static const char *kname[4] = { "none", "grayscale", "invert", EDGE_NAME "(SW only -> HW pass)" };   // kernel 4: lle_mem_test
 
     xil_printf("\r\nMemory test %dx%d, kernel %s, input %s\r\n", w, h, kname[kernel & 3],
-               use_loaded ? "loaded at 0x10000000" : "generated");
+               use_loaded ? LOADED_DESC : "generated");
+    if (use_loaded && !load_input(w, h)) return;
     if (!use_loaded) {
         for (int y = 0; y < h; y++) for (int x = 0; x < w; x++) in[y * w + x] = test_pixel(x, y);
     }
@@ -303,7 +609,7 @@ static void run_mem_test(int kernel, int use_loaded)
     if (kernel == 3) {                                          // SW-only Sobel timing on a copy
         u32 *tmp = (u32 *)TEST_REF;
         memcpy(tmp, in, bytes);
-        u64 q0 = zb_time(); k_sobel(tmp, w, h, w, sobel_tmp); sobel_t = zb_time() - q0;
+        u64 q0 = zb_time(); K_EDGE(tmp, w, h, w); sobel_t = zb_time() - q0;
         memcpy(ref, in, bytes);                                 // reference for pass-through
     }
 
@@ -344,7 +650,7 @@ static void run_mem_test(int kernel, int use_loaded)
     if (ref_kernel) xil_printf("  SW: %u us for the same kernel on the CPU (%u.%ux slower than the slot)\r\n",
                                sw_us, hw_us_x10 ? (sw_us * 10 / hw_us_x10) : 0,
                                hw_us_x10 ? ((sw_us * 100 / hw_us_x10) % 10) : 0);
-    if (kernel == 3) xil_printf("  SW Sobel: %u us\r\n", (u32)((sobel_t * 1000000ULL) / hz));
+    if (kernel == 3) xil_printf("  SW " EDGE_NAME ": %u us\r\n", (u32)((sobel_t * 1000000ULL) / hz));
     xil_printf("  %s: %u of %u pixels differ between HW and the C golden model\r\n",
                bad ? "FAIL" : "PASS", bad, (u32)w * h);
     xil_printf("  Input 0x%08x, HW result 0x%08x, SW reference 0x%08x (%u bytes each)\r\n",
@@ -374,6 +680,7 @@ static void run_mem_test(int kernel, int use_loaded)
 static void run_gap_test(void)
 {
     if (!zb_fbr2_available()) { xil_printf("Gap test needs v5 hardware (vfb_rd2)\r\n"); return; }
+    if (!TEST_OK()) { xil_printf("Gap test needs a u-dma-buf of >= 86 MB\r\n"); return; }
     const int w = test_sizes[test_size].w, h = test_sizes[test_size].h, S = w + GAP_PX;
     u32 *in = (u32 *)TEST_IN, *out = (u32 *)TEST_OUT, *guard = (u32 *)(TEST_OUT - GUARD_BYTES);
     const u32 hz = zb_time_hz(), bytes = (u32)S * h * 4;
@@ -459,12 +766,19 @@ static const char *hdmi_state(void)
     return !zb_hdmi_present() ? "absent" : zb_hdmi_connected() ? "monitor connected" : "no monitor";
 }
 
+#ifdef ZB_LINUX
+#define MENU_BATCH ""
+#else
+#define MENU_BATCH "  batch mode: mailbox 0x13000000 (xsct)"
+#endif
 static void menu(void)
 {
     xil_printf("\r\n---- zed_base jig ----------------------------------------------\r\n"
                " t  source: camera / test pattern      p  next test pattern\r\n"
                " d/D display mode                      c/C camera size\r\n"
-               " 0-3 kernel: none, gray, invert, Sobel x  HW (proc_slot) / SW (CPU)\r\n"
+               " 0-4 kernel: none, gray, invert, " EDGE_NAME ", LLE (global curve)\r\n"
+               " x  kernel in HW (proc_slot) / SW (CPU)" MENU_BATCH "\r\n"
+               " n  LLE iterations: auto (LiteIE rule) / 2 / 4 / 8 / 12 (forced, for demonstrations)\r\n"
                " m  memory test (generated image)      l  memory test (loaded image)\r\n"
                " r  memory-test size                   s  status   v  debug   h  menu\r\n"
                " g  gap test (where a memory-test shift arises: read, write or stream)\r\n"
@@ -483,22 +797,43 @@ static void menu(void)
 // Apply kernel / path: proc_slot runs it in the HW path; Sobel exists only in SW.
 static void set_proc(int new_path_sw, int new_kern)
 {
-    path_sw = new_path_sw; kern = new_kern & 3;
+    path_sw = new_path_sw; kern = (new_kern >= 0 && new_kern <= 4) ? new_kern : 0;
     if (!path_sw) raw_ready = -1;
-    live_hw_mode = (!path_sw && kern <= 2) ? (u32)kern : 0;
+    live_hw_mode = path_sw ? 0 : hw_mode_of(kern);
+    if (live_hw_mode == SLOT_MODE_LUT) {                    // a table must be in place first
+        lle_seq_seen = slot_rd(SLOT_STAT_SEQ);
+        lle_load(lle_force_tab[lle_force] ? lle_force_tab[lle_force] : lle_n_active > 0 ? lle_n_active : 8);
+    }
     slot_wr(SLOT_CTRL, live_hw_mode);
     xil_printf("Kernel %s in %s%s\r\n", kern_name[kern], path_sw ? "SW (CPU)" : "HW (proc_slot)",
-               (!path_sw && kern == 3) ? " -> Sobel is SW only, proc_slot passes through" : "");
+               (!path_sw && kern == 3) ? " -> " EDGE_NAME " is SW only, proc_slot passes through" : "");
 }
 
 int main(void)
 {
+#ifdef ZB_LINUX
+    xil_printf("\r\nzed_base jig (Linux)\r\n");
+    buf = (u32 (*)[CANVAS_MAX])zb_dma_base();
+    if ((u32)NBUF * CANVAS_MAX * 4 > zb_dma_size()) {
+        xil_printf("u-dma-buf too small: %u MB, live buffers need %u MB\r\n",
+                   zb_dma_size() >> 20, ((u32)NBUF * CANVAS_MAX * 4) >> 20);
+        return -1;
+    }
+    if (!TEST_OK()) xil_printf("u-dma-buf %u MB: live video only; memory/gap tests need >= 86 MB\r\n",
+                               zb_dma_size() >> 20);
+#else
     xil_printf("\r\nzed_base jig\r\n");
+#endif
     if (zb_gpio_init() != XST_SUCCESS) { xil_printf("GPIO init failed\r\n"); return -1; }
     zb_dma_reset_release();
     u32 id = slot_rd(SLOT_ID);
-    xil_printf("proc_slot ID = 0x%08x (expect 0x534c0002), memory test DMA %s\r\n",
-               id, zb_fbr2_available() ? "present" : "absent");
+    xil_printf("proc_slot ID = 0x%08x (expect 0x%08x), memory test DMA %s\r\n",
+               id, SLOT_ID_EXPECTED, zb_fbr2_available() ? "present" : "absent");
+    if (id != SLOT_ID_EXPECTED) xil_printf("WARNING: older proc_slot: kernel 4 (LLE) needs the v5 slot (shell v7)\r\n");
+#if !defined(ZB_LINUX)
+    memset((void *)MBOX, 0, MBOX_WORDS * 4);
+    Xil_DCacheFlushRange(MBOX, MBOX_WORDS * 4);
+#endif
     slot_wr(SLOT_CTRL, 0);
 
     // Start-up: 640x480 display and 640x480 camera (camera fills the screen)
@@ -537,6 +872,15 @@ int main(void)
             zb_fbw_set_addr(cam_addr(cam_p));
         }
 
+        // HW LLE: new statistics latched -> table for their iteration count (queued for the next frame)
+        if (!path_sw && kern == 4 && slot_rd(SLOT_STAT_SEQ) != lle_seq_seen && !lut_swap_pending()) {
+            lle_stats_t s;
+            lle_seq_seen = slot_rd(SLOT_STAT_SEQ);
+            slot_stats(&s);
+            lle_n_last = lle_pick(&s); lle_mean_last = mean_x1000(&s);
+            if (lle_n_last != lle_n_active) lle_load(lle_n_last);
+        }
+
         // SW path: process the newest camera frame, then display it
         if (path_sw && raw_ready >= 0) {
             cpu_hold = raw_ready; raw_ready = -1;
@@ -546,7 +890,14 @@ int main(void)
                 u32 *p = cam_ptr(cpu_hold);
                 if (kern == 1)      k_gray(p, cw, ch, canvas_w);
                 else if (kern == 2) k_invert(p, cw, ch, canvas_w);
-                else                k_sobel(p, cw, ch, canvas_w, sobel_tmp);
+                else if (kern == 3) K_EDGE(p, cw, ch, canvas_w);
+                else {                                       // LLE: statistics, table, apply
+                    lle_stats_t s; u8 tab[3][256];
+                    lle_stats(p, cw, ch, canvas_w, &s);
+                    lle_n_last = lle_pick(&s); lle_mean_last = mean_x1000(&s);
+                    lle_build_table(tab, lle_liteie_r, lle_n_last);
+                    lle_apply(p, cw, ch, canvas_w, tab);
+                }
                 Xil_DCacheFlushRange(cam_addr(cpu_hold), cam_span());
             }
             sw_time += zb_time() - t0;
@@ -565,6 +916,7 @@ int main(void)
             zb_leds((sw & 0x7F) | led_tog);
             if ((sw & 7) != (last_sw & 7)) set_proc(sw & 1, (sw >> 1) & 3);
             last_sw = sw;
+            mbox_poll();
         }
 
         // HDMI monitor plugged / unplugged (every ~0.5 s)
@@ -594,8 +946,14 @@ int main(void)
                 if (!cam_ok || !zb_camera_is_ov2640()) { xil_printf("Size change needs the OV2640\r\n"); break; }
                 apply_config(zb_display_mode(), (zb_camera_size() + (c == 'c' ? 1 : ns - 1)) % ns, 0, 1);
                 break;
-            case '0': case '1': case '2': case '3': set_proc(path_sw, c - '0'); reset_stats = 0; break;
+            case '0': case '1': case '2': case '3': case '4': set_proc(path_sw, c - '0'); reset_stats = 0; break;
             case 'x': set_proc(!path_sw, kern); reset_stats = 0; break;
+            case 'n':
+                lle_force = (lle_force + 1) % 5;
+                if (lle_force_tab[lle_force]) xil_printf("LLE iterations: %d (forced)\r\n", lle_force_tab[lle_force]);
+                else                          xil_printf("LLE iterations: auto (LiteIE rule)\r\n");
+                lle_seq_seen = ~0u;                          // rebuild on the next statistics
+                reset_stats = 0; break;
             case 'r':
                 test_size = (test_size + 1) % NUM_TEST_SIZES;
                 xil_printf("Memory test size %dx%d\r\n", test_sizes[test_size].w, test_sizes[test_size].h);
@@ -642,6 +1000,8 @@ int main(void)
                        cam_r / 100, cam_r % 100, flip_r / 100, flip_r % 100, disp_r / 100, disp_r % 100,
                        slot_r / 100, slot_r % 100,
                        slot_rd(SLOT_PIXELS_LAST), slot_rd(SLOT_LINES_LAST), slot_rd(SLOT_STALLS_LAST));
+            if (kern == 4 && lle_n_last > 0)
+                xil_printf(" | LLE mean %u.%03u, %d iterations", lle_mean_last / 1000, lle_mean_last % 1000, lle_n_last);
             if (path_sw && sw_frames) {
                 u32 avg = ms_x100(sw_time / sw_frames);
                 xil_printf(" | SW kernel %u.%02u ms/frame", avg / 100, avg % 100);

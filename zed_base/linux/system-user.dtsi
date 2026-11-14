@@ -1,0 +1,25 @@
+/include/ "system-conf.dtsi"
+/ {
+    udmabuf_frames: udmabuf@0 {
+        compatible  = "ikwzm,u-dma-buf";
+        device-name = "udmabuf0";
+        size        = <0x08000000>;   /* 128 MB from CMA */
+    };
+};
+
+/* Video pipeline + custom IP: hand to userspace via UIO */
+&vfb_rd       { compatible = "generic-uio"; };
+&vfb_rd2      { compatible = "generic-uio"; };
+&vfb_wr       { compatible = "generic-uio"; };
+&vtc          { compatible = "generic-uio"; };
+&clk_wiz_pix  { compatible = "generic-uio"; };
+&proc_slot    { compatible = "generic-uio"; };
+&accel        { compatible = "generic-uio"; };
+
+/* axi_gpio_btns / axi_gpio_ledsw: left on the kernel gpio-xilinx driver (use libgpiod).
+   To drive them by raw registers instead, uncomment:
+&axi_gpio_btns { compatible = "generic-uio"; };
+&axi_gpio_ledsw { compatible = "generic-uio"; };
+*/
+
+

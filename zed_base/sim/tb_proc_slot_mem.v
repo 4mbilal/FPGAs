@@ -84,7 +84,7 @@ module tb;
     reg [31:0] r; integer cam_before;
     initial begin
         repeat (5) @(posedge aclk); aresetn = 1; repeat (5) @(posedge aclk);
-        axi_read(8'h04, r); $display("ID = %h (exp 534c0002)", r);
+        axi_read(8'h04, r); $display("ID = %h (exp 534c0005)", r);
         // camera selected: camera tready follows the output (always ready here), mem held off
         repeat (10) @(posedge aclk);
         $display("camera selected: mem tready = %b (exp 0)", m_tready_in);

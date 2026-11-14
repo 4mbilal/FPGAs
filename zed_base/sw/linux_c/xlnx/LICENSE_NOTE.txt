@@ -1,0 +1,3 @@
+Files in this folder are unmodified copies from https://github.com/Xilinx/embeddedsw,
+tag xilinx_v2024.2 (XilinxProcessorIPLib/drivers/vtc, v_frmbuf_rd, v_frmbuf_wr,
+video_common). Copyright Xilinx, Inc. / Advanced Micro Devices, Inc. SPDX-License-Identifier: MIT.

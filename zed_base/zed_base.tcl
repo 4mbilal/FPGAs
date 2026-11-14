@@ -1,5 +1,5 @@
 # ----------------------------------------------------------------------------
-# zed_base.tcl  (v6: v5 + HDMI)
+# zed_base.tcl  (v7: v6 + frozen shell for Linux + proc_slot v5 with curve table)
 # ZedBoard base platform for Vivado 2024.2 (Avnet zedboard 1.5 board files)
 #
 #   PS7       : board preset (DDR3, clocks, MIO), UART1 on MIO 48-49 @115200
@@ -21,13 +21,18 @@
 #   Modes     : display mode switchable at run time (clk_wiz dynamic reconfiguration,
 #               640x480 .. 1920x1080); camera size switchable (176x144 .. 1600x1200)
 #   Mem test  : DRAM -> vfb_rd2 (HP2) -> proc_slot (CTRL[4]=1) -> vfb_wr -> DRAM
+#   Shell v7  : frozen for PetaLinux (build_shell_v7): FCLK3 200 MHz, HP3, 8 EMIO GPIOs,
+#               16 fabric interrupts (3 proc_slot, 4 accel), proc_slot window 64 KB,
+#               accelerator window 64 KB at 0x43E00000 (accel_stub). Later versions that keep
+#               this fingerprint (tools/shell_check.py) are bitstream-only updates.
 #   Output    : bitstream + XSA (bitstream included) for Vitis / PetaLinux
 #
 # Files (relative to this script):
 #   tcl/bd_procs.tcl   block design procs (shared with add_camera.tcl)
 #   rtl/vga_pack.v  rtl/hdmi_pack.v  rtl/dvp_capture.v  rtl/clk_forward.v  rtl/proc_slot.v
+#   rtl/accel_stub.v
 #   constr/vga.xdc  constr/hdmi.xdc  constr/camera.xdc
-#   sw/jig.c (test app), sw/common/ (shared code)
+#   sw/common/ (jig.c test app and shared code), sw/linux_c, sw/python (Linux)
 #
 # Usage:
 #   GUI : Tools -> Run Tcl Script -> zed_base.tcl
@@ -93,6 +98,7 @@ build_camera
 build_processing
 build_display_reconfig $pix_max_mhz
 build_memtest $test_max_cols $test_max_rows
+build_shell_v7
 assign_bd_address
 regenerate_bd_layout
 validate_bd_design

@@ -18,8 +18,8 @@
 // edge pixels of a line repeat themselves as the missing neighbour:
 //   even pixel n:   {Cb_f(n), Y(n)}     odd pixel n+1: {Cr_f(n), Y(n+1)}
 //
-// Latency: 6 register stages (input register .. output register), the same for data, DE,
-// HSYNC and VSYNC. The VGA output (vga_pack, 1 stage) leads by 5 pixels; irrelevant, as the
+// Latency: 7 register stages (input register .. output register), the same for data, DE,
+// HSYNC and VSYNC. The VGA output (vga_pack, 1 stage) leads by 6 pixels; irrelevant, as the
 // two outputs go to different monitors.
 // Checked bit-exact against sim/check_hdmi.c (C golden model) with sim/tb_hdmi_pack.v.
 // Outputs are registered (packed into the IOBs by hdmi.xdc). The pixel clock goes to the
@@ -97,24 +97,31 @@ module hdmi_pack (
         uC <= uB; vC <= vB; deC <= sB[0];
     end
 
-    // ---- stage 4: [1 2 1]/4 chroma filter around B, 4:2:2 packing ----------------
+    // ---- stage 4: [1 2 1]/4 chroma filter around B (registered) --------------------
     wire [7:0] uL = deC   ? uC : uB,  uR = sA[0] ? uA : uB;
     wire [7:0] vL = deC   ? vC : vB,  vR = sA[0] ? vA : vB;
     wire [9:0] u_f = {2'b0, uL} + {1'b0, uB, 1'b0} + {2'b0, uR} + 10'd2;
     wire [9:0] v_f = {2'b0, vL} + {1'b0, vB, 1'b0} + {2'b0, vR} + 10'd2;
-    reg  [7:0] cr_hold;
-
+    reg  [7:0] uF, vF, yF;
+    reg  [2:0] sF;
+    reg        phF;
     always @(posedge pix_clk) begin
-        hd_de    <= sB[0];
-        hd_hsync <= sB[1];
-        hd_vsync <= sB[2];
-        if (!sB[0]) begin
+        uF <= u_f[9:2]; vF <= v_f[9:2]; yF <= yB; sF <= sB; phF <= phB;
+    end
+
+    // ---- stage 5: 4:2:2 packing -----------------------------------------------------
+    reg  [7:0] cr_hold;
+    always @(posedge pix_clk) begin
+        hd_de    <= sF[0];
+        hd_hsync <= sF[1];
+        hd_vsync <= sF[2];
+        if (!sF[0]) begin
             hd_d <= {8'h80, 8'h10};
-        end else if (!phB) begin
-            hd_d    <= {u_f[9:2], yB};              // even: Cb, Y
-            cr_hold <= v_f[9:2];                    // Cr of the same (even) position
+        end else if (!phF) begin
+            hd_d    <= {uF, yF};                    // even: Cb, Y
+            cr_hold <= vF;                          // Cr of the same (even) position
         end else begin
-            hd_d    <= {cr_hold, yB};               // odd: Cr, Y
+            hd_d    <= {cr_hold, yF};               // odd: Cr, Y
         end
     end
 

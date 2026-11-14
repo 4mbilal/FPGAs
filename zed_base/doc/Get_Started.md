@@ -1,5 +1,11 @@
 # ZedBoard Bring-up with Vivado / Vitis 2024.2
 
+> Repository layout since 2026-11-14 (merge of the bare-metal and Linux code): shared C in
+> `sw/common/` (jig.c, zb_platform, ov2640_regs.h, sw_kernels, lle_global), Linux C build in
+> `sw/linux_c/`, Python in `sw/python/`, scripts in `tools/` (formerly `sw/tools/`), PetaLinux
+> files in `linux/`, documents in `doc/`. Paths in the dated sections below are given as they
+> were at the time; `README.md` and `CLAUDE.md` have the current map.
+
 ## 1. Install the board files
 
 ZedBoard is not listed in Vivado 2024.2 by default. Board files are no longer bundled with Vivado.
@@ -70,11 +76,11 @@ zed_base/
   sim/tb_hdmi_pack.v    hdmi_pack raster test (dumps vectors)
   sim/check_hdmi.c      hdmi_pack C golden model + colour round trip through the ADV7511 CSC
   sim/rotation_model.py buffer rotation model (both DMAs + polling loop)
-  sw/jig.c              the only test app: one main(), everything from a UART menu
+  sw/common/jig.c       the only test app: one main(), everything from a UART menu
                         (test patterns, camera, kernels HW/SW, modes, memory test)
-  sw/common/            zb_platform.c/.h (board bring-up), sw_kernels.c/.h (golden
-                        model), ov2640_regs.h (all OV2640 sizes)
-  sw/tools/rawimg.py    PNG <-> raw XRGB8888 for memory tests over JTAG
+  sw/common/            zb_platform.c/.h (board bring-up), sw_kernels.c/.h, lle_global.c/.h
+                        (golden models), ov2640_regs.h (all OV2640 sizes)
+  tools/rawimg.py       PNG <-> raw XRGB8888 for memory tests
 ```
 
 It creates:
@@ -427,7 +433,7 @@ TEST_IN 0x10000000 -> vfb_rd2 (HP2) -> proc_slot (CTRL[4]=1) -> vfb_wr -> TEST_O
 ### 12.5 Running it
 1. With the v4 project open, run `add_v5.tcl` (or build fresh with `zed_base.tcl`).
 2. Update the Vitis platform to the new XSA and rebuild it.
-3. One Vitis app, `jig`: `jig.c` plus everything in `sw/common/`, flat in `src/`. Serial terminal at 115200; the jig reads single key presses.
+3. One Vitis app, `jig`: everything in `sw/common/` (jig.c included), flat in `src/`. Serial terminal at 115200; the jig reads single key presses.
 4. `vga_test.c`, `cam_test.c` and `proc_test.c` are merged into `jig.c` (single `main()`); delete the old apps from the Vitis workspace.
 
 ### 12.6 Things to confirm on hardware
@@ -600,3 +606,129 @@ The jig checks the setup every 0.5 s and re-applies it if the chip was reset; it
 - Result: with the re-apply off (`a`) the picture is perfect, although "setup lost" is still reported now and then. So the chip never lost its setup: the check misread the registers, and the re-apply itself caused the purple tint (colour conversion held while the coefficients are reloaded) and the sync losses (power and PLL registers rewritten). Fix: automatic re-apply off by default; the check still logs. Logged: `41=14 15=14 16=14 18=14 42=14`, the same value for five different registers, so the reads were wrong, not the chip. Reads changed from write-stop-read to one transaction with a repeated start (as the Linux driver); a read where all five registers agree is now counted as an I2C error ("suspect I2C read") and ignored. Confirmed on the board (2026-11-07): after several minutes `H` shows 0 re-applies, 0 HPD changes, 0 I2C read errors; monitor connected, TMDS PLL locked, input VIC 1 (640x480), CSC on (18=C7), DVI mode; picture correct. This also matters at set-up, where register updates are read-modify-write.
 - v6 confirmed on the board (2026-11-07, Samsung TV + VGA monitor): all display modes and camera sizes work on both outputs at the same time; colour bars in the right order with correct hues, checkerboard sharp, grey ramp from black to white; no sparkles at 1080p with the default clock delay (0 ps), so `k` was not needed. The ripple patterns in phone photos of the TV are moire between the camera sensor and the TV's pixel grid, not in the signal. If the red 1-pixel frame is missing on some edges, the TV is overscanning (set the TV's picture size to "Screen Fit" / "Just Scan").
 - Not done: audio, EDID reading (the mode list stays fixed), CEC, HDMI mode with infoframes.
+
+## 15. Version 7: low-light enhancement, global curve mode
+
+### 15.1 What it does
+The Zero-DCE / LiteIE curve x <- x + r_c (x^2 - x), applied n times per channel, depends only
+on the pixel value when r_c is constant over the frame, so it is a 256-entry table per channel.
+LiteIE's released network outputs such a constant (r = -0.3709, -0.3668, -0.3705 for R, G, B)
+and picks n from the frame mean (8 below 0.1, otherwise a quartic, 1..15). In hardware:
+```
+input pixels -> statistics (16-bin luma histogram, R/G/B sums, count) -> latched at frame start
+                                 | AXI-Lite                 ^ CPU: mean -> n -> 768 entries
+input pixels -> table (mode 3, bank active for this frame) -> output
+```
+The table has two banks: the CPU writes the inactive one and requests a swap, which happens at
+the next input start of frame. In live video the table therefore follows the statistics of the
+previous frame (one frame of lag). Still images (memory test, batch mode) run twice: a
+pass-through pass for the statistics, then the table pass.
+
+### 15.2 Hardware (`rtl/proc_slot.v` v5, ID 0x534C0005)
+- Mode 3 = table: `out_c = LUT_c[in_c]`, distributed RAM, asynchronous read, still 1 pixel/clock
+  in one pipeline stage.
+- Register window 64 KB (shell v7, section 16). Main registers: `0x28 CAPS`, `0x2C LUT_BANK`
+  (write 1: swap at next frame start; read: pending, active bank), `0x30 STAT_SEQ`,
+  `0x34 STAT_CTRL` (write 1: latch now), `0x38 IRQ_EN`, `0x3C IRQ_STATUS` (write 1 to clear);
+  table at `0x0400 / 0x0800 / 0x0C00 + 4 x` for R / G / B (inactive bank, one entry per word);
+  statistics at `0x1000` (count), `0x1004..0x100C` (sums), `0x1040..0x107C` (histogram).
+  Full map in the header of `proc_slot.v`.
+- Interrupt (level, `IRQ_F2P[3]`): bit 0 statistics latched, bit 1 output start of frame.
+- Statistics are taken on the input pixels whatever the mode, one pipeline stage behind the
+  stream, so they do not depend on output backpressure.
+
+### 15.3 Verification before hardware
+- `sim/tb_proc_slot_lle.v`: table output per channel under random gaps and backpressure, a swap
+  requested mid-frame (takes effect only at the next frame), writes into the inactive bank during
+  a frame (no effect on the output), statistics at frame start and on STAT_CTRL, sequence counter,
+  interrupt status / enable / write-1-to-clear. Copies of the RTL with the swap timing, the
+  interrupt clear, the interrupt enable or the table addressing broken all fail it.
+- `sim/check_lle.c`: the RTL statistics against `lle_stats()` in `sw/lle_global.c`; table
+  properties (identity at r = 0, monotonic and brightening for every n).
+- In the llie_fpga repository, `scripts/check_hwglobal.py` checks `sw/lle_global.c` bit-exact
+  against its Python model and against the official LiteIE: on the 15 LOL-v1 test images the
+  table output is within 2 codes of LiteIE (74 dB) with the same PSNR to the references (18.89 dB).
+- `sh sim/run_all.sh` runs all of it.
+
+### 15.4 Running it
+- Rebuild with `zed_base.tcl` (v7 includes the shell changes of section 16). Add
+  `sw/lle_global.c` and `sw/lle_global.h` to the Vitis app.
+- Key `4`: low-light enhancement on the live camera, in the slot (`x` toggles the CPU version
+  of the same computation). The status line shows the frame mean and the iteration count.
+- Keys `m` / `l` with kernel 4: memory test (generated dark image or a loaded one), HW against
+  the C model: statistics, iteration count and every pixel must agree.
+- Batch mode for datasets: with the jig running, `xsct tools/batch.tcl <in_dir> <out_dir>`
+  sends every `<name>_<W>x<H>.bin` through the slot via a mailbox at 0x13000000 and reads back
+  the HW and C-model results plus `results.csv`. The jig copies each image to a 256-byte
+  aligned stride (0x14000000 / 0x15000000) for the DMAs. llie_fpga's `run_phase3a.sh` prepares
+  the datasets and scores the results.
+
+### 15.5 Things to confirm on hardware
+- Timing at 150 MHz with the three 512 x 8 distributed RAMs in the stream stage (check WNS on
+  the FCLK1 domain) and the utilisation increase (expected: a few hundred LUTs, no BRAM, no DSP).
+- `m` with kernel 4 at every memory-test size: PASS, statistics identical.
+- Batch mode over JTAG: xsct `stop`/`con` around every memory access; if the jig misbehaves
+  after a stop, report it (the DMA wait loops use the global timer).
+- `sim/run_all.sh` previously pointed at `sw/common/`, which this repository no longer has; fixed.
+
+## 16. Shell v7: a hardware base frozen for Linux
+
+### 16.1 Why
+Under Linux, the PetaLinux image (FSBL PS initialisation, device tree) depends on the PS7
+configuration, the address map and the fabric interrupts. Any change there costs a PetaLinux
+rebuild; a change inside the PL that keeps all three is just a new bitstream, loaded at run time.
+v7 fixes all three once, with room for the coming work, so later versions are bitstream-only.
+
+| Cost | Change |
+|---|---|
+| none | software on the board |
+| none | bitstream with the same PS7 settings, addresses and interrupts (FPGA manager, or swap `system.bit` in `BOOT.BIN`) |
+| device tree | new PL device / address / interrupt (runtime overlay or device-tree-only rebuild) |
+| boot loader + device tree | PS7 changes: clocks, HP ports, EMIO, interrupt enable (new XSA, incremental build) |
+| full | kernel configuration or modules |
+
+### 16.2 What the shell fixes (`build_shell_v7` in `tcl/bd_procs.tcl`)
+| Item | v6 | Shell v7 |
+|---|---|---|
+| FCLK | 0: 100, 1: 150, 2: 25 MHz (camera XCLK) | + FCLK3 200 MHz (spare compute clock) |
+| HP ports | HP0 display, HP1 camera/test writes, HP2 test reads | + HP3 64-bit (accelerator window) |
+| EMIO GPIO | 3 (54-56 frame buffer resets) | 8 (57-61 spare) |
+| `IRQ_F2P` | 3 lines | 16: 0 vfb_rd, 1 vfb_wr, 2 vfb_rd2, 3 proc_slot, 4 accel, 5-15 tied 0 |
+| proc_slot window | 4 KB | 64 KB at 0x43D00000 (all low-light work lives inside: table, statistics, later the spatial-mode network and its weights at 0x8000) |
+| accelerator window | none | 64 KB at 0x43E00000, `rtl/accel_stub.v` on FCLK3: ID 0x41430000, scratch register, interrupt test bit, idle AXI4 master on HP3. A future engine replaces the module with the same ports. |
+
+### 16.3 One-time Linux update (the last planned PetaLinux build)
+1. Build v7: `vivado -mode batch -source zed_base.tcl`. Check timing (WNS) and utilisation.
+2. Record the shell fingerprint and commit it:
+   `python3 tools/shell_check.py freeze zed_base/system_wrapper.xsa tools/shell_v7.json`
+   (it lists the address map and the interrupt order; compare with 16.2).
+3. PetaLinux: `petalinux-config --get-hw-description=<path to v7 xsa>` (keep the menu settings),
+   add the accelerator node to `system-user.dtsi`:
+   ```dts
+   &accel        { compatible = "generic-uio"; };
+   ```
+   (`proc_slot` and the frame buffers are already `generic-uio`; `pl.dtsi` now carries their
+   interrupts.) Then `petalinux-build`, `petalinux-package boot ...`, copy `BOOT.BIN`, `image.ub`,
+   `boot.scr`. If the kernel was rebuilt (check `uname -r` after boot and `ls /lib/modules`), copy
+   `lib/modules` again and run `depmod -a`.
+4. On the board: `sudo python3 tools/shell_test.py`: finds both windows by UIO name and
+   address, checks IDs, map sizes (64 KB) and both interrupts through UIO (no video needed).
+
+### 16.4 Every later hardware version
+```bash
+python3 tools/shell_check.py check zed_base/system_wrapper.xsa tools/shell_v7.json
+#   SHELL MATCH   -> bitstream only:
+sh tools/make_bin.sh zed_base/zed_base.runs/impl_1/system_wrapper.bit     # on the PC
+sudo sh load_bitstream.sh system_wrapper.bit.bin                             # on the board
+#   SHELL CHANGED -> the report says whether the device tree or the boot loader is affected
+```
+For a permanent change, `petalinux-package boot --fsbl ... --fpga <new .bit> --u-boot --force`
+replaces only the bitstream inside `BOOT.BIN` (seconds, no build).
+
+### 16.5 Notes
+- Interrupts under UIO: write 1 to `/dev/uioN` to (re-)enable, then `read()` or `select()` blocks
+  until the next interrupt; clear the source (`IRQ_STATUS` write-1) before re-enabling. Both
+  interrupts are level-sensitive.
+- `jig.c` keeps the xsct mailbox batch mode for bare metal only (`#if !defined(__linux__)`);
+  under Linux, datasets are read from files on the board.
+

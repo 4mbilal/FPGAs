@@ -9,7 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#define LAT 5            /* rows between an input row and its output row in the vector file */
+#define LAT 6            /* rows between an input row and its output row in the vector file */
 
 static int clampi(int v, int lo, int hi) { return v < lo ? lo : v > hi ? hi : v; }
 static int asr10(int v) { return v >= 0 ? v >> 10 : -((-v + 1023) >> 10); }   /* floor(v / 1024) */

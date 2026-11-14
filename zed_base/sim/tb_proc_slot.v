@@ -104,7 +104,7 @@ module tb;
         frame_mode[0] = 0; frame_mode[1] = 1; frame_mode[2] = 2; frame_mode[3] = 1; frame_mode[4] = 0;
         repeat (5) @(posedge aclk); aresetn <= 1; repeat (5) @(posedge aclk);
 
-        axi_read(8'h04, r); $display("ID = %h (exp 534c0002)", r);
+        axi_read(8'h04, r); $display("ID = %h (exp 534c0005)", r);
         for (f = 0; f < 5; f = f + 1) begin
             // set the mode for frame f before its start of frame; for f>0, write it
             // mid-way through frame f-1 to check it only takes effect at the next frame

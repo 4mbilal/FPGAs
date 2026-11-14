@@ -321,9 +321,10 @@ proc build_camera {} {
 # ---- block design: processing slot in the camera stream ----------------------
 #   cam_fifo -> proc_slot (RTL, 150 MHz, AXI-Lite on GP0) -> vfb_wr
 #   Fixed AXI-Lite address so software does not depend on generated macros.
-set PROC_SLOT_ADDR 0x43D00000
+set PROC_SLOT_ADDR  0x43D00000
+set PROC_SLOT_RANGE 64K           ;# shell v7: was 4K
 proc build_processing {} {
-    global PROC_SLOT_ADDR
+    global PROC_SLOT_ADDR PROC_SLOT_RANGE
     set fclk1 [get_bd_pins ps7/FCLK_CLK1]
 
     # Break the direct camera FIFO -> frame buffer write link
@@ -337,13 +338,18 @@ proc build_processing {} {
     connect_bd_intf_net [get_bd_intf_pins proc_slot/m_axis]  [get_bd_intf_pins vfb_wr/s_axis_video]
 
     axi_lite_to_gp0 proc_slot/s_axi
-    set seg [get_bd_addr_segs -quiet -of_objects [get_bd_intf_pins proc_slot/s_axi]]
-    set addr_seg [get_bd_addr_segs -quiet ps7/Data/SEG_proc_slot_*]
+    fixed_address proc_slot s_axi $PROC_SLOT_ADDR $PROC_SLOT_RANGE
+}
+
+# Pin an AXI-Lite slave of instance <cell> at a fixed GP0 address and range.
+proc fixed_address {cell intf addr range} {
+    set seg [get_bd_addr_segs -quiet -of_objects [get_bd_intf_pins $cell/$intf]]
+    set addr_seg [get_bd_addr_segs -quiet ps7/Data/SEG_${cell}_*]
     if {$addr_seg ne ""} {
-        set_property offset $PROC_SLOT_ADDR $addr_seg
-        set_property range 4K $addr_seg
+        set_property offset $addr $addr_seg
+        set_property range $range $addr_seg
     } elseif {$seg ne ""} {
-        assign_bd_address -offset $PROC_SLOT_ADDR -range 4K $seg
+        assign_bd_address -offset $addr -range $range $seg
     }
 }
 
@@ -437,3 +443,69 @@ proc build_outputs {proj_dir bd_name jobs} {
     write_hw_platform -fixed -include_bit -force -file $xsa
     puts "DONE. XSA for Vitis: $xsa"
 }
+
+# Constant driver of a given value and width (xlconstant, or inline-HDL constant).
+proc const_val {name val width} {
+    if {[catch {create_bd_cell -type ip -vlnv xilinx.com:ip:xlconstant $name}]} {
+        create_bd_cell -type inline_hdl -vlnv xilinx.com:inline_hdl:ilconstant $name
+    }
+    set_property -dict [list CONFIG.CONST_VAL $val CONFIG.CONST_WIDTH $width] [get_bd_cells $name]
+    return [get_bd_pins $name/dout]
+}
+
+# ---- shell v7: frozen PS7 configuration, address windows and interrupts ------------
+#   Everything the PetaLinux image depends on (FSBL PS initialisation, device tree) is fixed
+#   here once, with room to grow, so later hardware versions are bitstream-only updates:
+#     PS7    FCLK3 200 MHz (spare compute clock; FCLK0 100, FCLK1 150, FCLK2 25 = camera XCLK)
+#            S_AXI_HP3 64-bit (reserved for the accelerator window)
+#            8 EMIO GPIOs: 54 vfb_rd, 55 vfb_wr, 56 vfb_rd2 resets, 57-61 spare
+#     IRQ_F2P[15:0]: 0 vfb_rd, 1 vfb_wr, 2 vfb_rd2, 3 proc_slot, 4 accel, 5-15 tied 0
+#     GP0 windows: proc_slot 64 KB at 0x43D00000, accel 64 KB at 0x43E00000
+#     accel: accel_stub (RTL) on FCLK3 with an idle AXI4 master on HP3; a future engine
+#            replaces the module with the same ports
+#   tools/shell_check.py compares any later XSA against the frozen fingerprint.
+set ACCEL_ADDR  0x43E00000
+set ACCEL_RANGE 64K
+proc build_shell_v7 {} {
+    global ACCEL_ADDR ACCEL_RANGE
+
+    # PS7
+    disconnect_pin ps7/GPIO_O
+    set_property -dict [list \
+        CONFIG.PCW_EN_CLK3_PORT {1} \
+        CONFIG.PCW_FPGA3_PERIPHERAL_FREQMHZ {200} \
+        CONFIG.PCW_USE_S_AXI_HP3 {1} \
+        CONFIG.PCW_S_AXI_HP3_DATA_WIDTH {64} \
+        CONFIG.PCW_GPIO_EMIO_GPIO_IO {8} \
+    ] [get_bd_cells ps7]
+    foreach s {emio_rst_rd emio_rst_wr emio_rst_rd2} {
+        set_property CONFIG.DIN_WIDTH {8} [get_bd_cells $s]
+    }
+    connect_bd_net [get_bd_pins ps7/GPIO_O] [get_bd_pins emio_rst_rd/Din] \
+                   [get_bd_pins emio_rst_wr/Din] [get_bd_pins emio_rst_rd2/Din]
+
+    # Accelerator window: reset on FCLK3, stub module, GP0 slave, HP3 master
+    set fclk3 [get_bd_pins ps7/FCLK_CLK3]
+    create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset rst_acc
+    connect_bd_net $fclk3 [get_bd_pins rst_acc/slowest_sync_clk]
+    connect_bd_net [get_bd_pins ps7/FCLK_RESET0_N] [get_bd_pins rst_acc/ext_reset_in]
+    create_bd_cell -type module -reference accel_stub accel
+    connect_bd_net $fclk3 [get_bd_pins accel/aclk]
+    connect_bd_net [get_bd_pins rst_acc/peripheral_aresetn] [get_bd_pins accel/aresetn]
+    axi_lite_to_gp0 accel/s_axi
+    fixed_address accel s_axi $ACCEL_ADDR $ACCEL_RANGE
+    apply_bd_automation -rule xilinx.com:bd_rule:axi4 -config [list \
+        Clk_master {Auto} Clk_slave {Auto} Clk_xbar {Auto} \
+        Master {/accel/m_axi} Slave {/ps7/S_AXI_HP3} \
+        ddr_seg {Auto} intc_ip {New AXI Interconnect} master_apm {0}] \
+        [get_bd_intf_pins ps7/S_AXI_HP3]
+
+    # Interrupts: 16 lines, fixed order
+    disconnect_pin irq_concat/dout
+    set_property -dict [list CONFIG.NUM_PORTS {6} CONFIG.IN5_WIDTH {11}] [get_bd_cells irq_concat]
+    connect_bd_net [get_bd_pins proc_slot/irq] [get_bd_pins irq_concat/In3]
+    connect_bd_net [get_bd_pins accel/irq]     [get_bd_pins irq_concat/In4]
+    connect_bd_net [const_val irq_zero 0 11]   [get_bd_pins irq_concat/In5]
+    connect_bd_net [get_bd_pins irq_concat/dout] [get_bd_pins ps7/IRQ_F2P]
+}
+
